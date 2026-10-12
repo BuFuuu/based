@@ -1,0 +1,19 @@
+// Package collectors holds every scan phase. To add a check (for example
+// persistence locations or network listeners), implement scan.Collector in a
+// new file and append it to All. Views pick up new finding kinds
+// automatically.
+package collectors
+
+import "github.com/BuFuuu/based/internal/scan"
+
+func All() []scan.Collector {
+	return []scan.Collector{
+		&PacmanDB{},
+		&SystemFiles{},
+		&HomeFiles{},
+		&TempFiles{},
+		&Packages{},
+		&Persistence{},
+		&Network{},
+	}
+}

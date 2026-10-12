@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.bufuuu.based",
+  "name": "Based",
+  "version": "0.1.0",
+  "author": "BuFuuu",
+  "license": "MIT",
+  "description": "Shows what is on your Omarchy system that Omarchy did not put there: unowned and changed files, extra packages, autostart and network programs. Needs the based program from the same repo.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Widget.qml" },
+  "keywords": ["security", "integrity", "audit", "scan", "files", "packages"],
+  "barWidget": {
+    "displayName": "Based",
+    "description": "A line with a dot above it; the tooltip summarises the last scan. Left click: timeline. Right click: scan.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
