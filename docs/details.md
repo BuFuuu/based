@@ -6,9 +6,11 @@ stops.
 
 ## Install, other ways
 
-`install.sh` builds the program with Go if you have it (`omarchy pkg add go`);
-otherwise it downloads the ready-made program from the latest release. You
-need Omarchy with its shell plugins.
+`install.sh` builds the program from this repo's source, so it needs Go
+(`omarchy pkg add go`), and Omarchy with its shell plugins. Ready-made
+programs for amd64 and arm64, with their SHA-256 sums, are on the
+[releases page](https://github.com/BuFuuu/based/releases) if you would rather
+put one in `~/.local/bin` yourself.
 
 To add the bar icon through Omarchy's plugin manager instead, then fetch the
 program it needs:
@@ -54,11 +56,11 @@ lowest level shown.
 
 | | |
 |---|---|
-| Needs | Omarchy with Hyprland, a terminal via `xdg-terminal-exec` (Omarchy's default), `wl-copy` for copying, pacman. Go 1.27+ only to build from source. |
+| Needs | Omarchy with Hyprland, a terminal via `xdg-terminal-exec` (Omarchy's default), `wl-copy` for copying, pacman, and Go 1.27+ to build it (`omarchy pkg add go`). |
 | Reads | your files and the system's files, the pacman database, and `/proc` for programs and network connections. |
 | Writes | only `~/.local/state/based` (scans, accepts, reports), `~/.local/bin/based` and its plugin folder. |
 | Root | only when you ask: `based scan --sudo` or `R` runs the scan through `sudo`, which asks for your password. It still writes only to your own state folder. |
-| Network | none. Based never uploads, downloads or looks anything up. Only `install.sh` downloads, and only the release program when you have no Go. |
+| Network | none. Based never uploads, downloads or looks anything up. `install.sh` builds from the files you cloned. |
 | Desktop | opening the window adds a Hyprland rule that floats and sizes it. When the bar icon changes, `install.sh` restarts the Omarchy shell so it loads the new one. |
 
 ## Report for AI
@@ -233,7 +235,7 @@ manifest.json, Widget.qml   the Omarchy bar icon
 ```
 
 A version tag (`v0.1.0`) builds the program for Linux (amd64, arm64) and
-attaches it to a GitHub release, where `install.sh` finds it.
+attaches it to a GitHub release.
 
 ## License
 

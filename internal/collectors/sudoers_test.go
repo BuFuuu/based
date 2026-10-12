@@ -17,8 +17,8 @@ func TestInstallerSudoRule(t *testing.T) {
 	}{
 		{"04_alice", "alice ALL=(ALL) ALL\n", true},
 		{"00_alice", "# added\nalice  ALL=(ALL)  ALL\n", true},
-		{"04_alice", "alice ALL=(ALL) NOPASSWD: ALL\n", false},
-		{"04_alice", "alice ALL=(ALL) ALL\nalice ALL=(ALL) NOPASSWD: ALL\n", false},
+		{"04_alice", "alice ALL=(ALL) NOPASSWD: /usr/local/bin/backup\n", false},
+		{"04_alice", "alice ALL=(ALL) ALL\nalice ALL=(ALL) NOPASSWD: /usr/local/bin/backup\n", false},
 		{"04_eve", "eve ALL=(ALL) ALL\n", false},   // not in the install log
 		{"04_ali", "ali ALL=(ALL) ALL\n", false},   // prefix of a logged user
 		{"04_alice", "eve ALL=(ALL) ALL\n", false}, // name and rule disagree

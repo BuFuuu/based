@@ -1,5 +1,5 @@
 # On a version tag (v0.1.0, ...), build the based program for Linux and
-# attach it to a GitHub release, where install.sh finds it when Go is missing.
+# attach it to a GitHub release.
 name: release
 on:
   push:

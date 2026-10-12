@@ -1,11 +1,10 @@
 #!/bin/bash
 # Install Based: the based program into ~/.local/bin and the bar widget into
-# the Omarchy shell. Builds from source when Go is available, otherwise
-# downloads the release binary. Run with --uninstall to remove both again.
+# the Omarchy shell. Builds the program from this repo's source with Go.
+# Run with --uninstall to remove both again.
 set -euo pipefail
 
 cd "$(dirname "$0")"
-REPO="BuFuuu/based"
 PLUGIN_ID="io.github.bufuuu.based"
 BIN_DIR="$HOME/.local/bin"
 PLUGIN_DIR="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
@@ -25,31 +24,17 @@ if [[ ${1:-} == "--uninstall" ]]; then
   exit 0
 fi
 
-mkdir -p "$BIN_DIR"
 if command -v go >/dev/null; then
   GO=(go)
 elif command -v mise >/dev/null && mise which go >/dev/null 2>&1; then
   GO=(mise exec -- go)
 else
-  GO=()
+  echo "Based is built from this repo's Go source, and Go is missing: omarchy pkg add go" >&2
+  exit 1
 fi
-if ((${#GO[@]})); then
-  echo "Building based…"
-  "${GO[@]}" build -trimpath -ldflags "-s -w" -o "$BIN_DIR/based" ./cmd/based
-else
-  case "$(uname -m)" in
-  x86_64) arch=amd64 ;;
-  aarch64 | arm64) arch=arm64 ;;
-  *)
-    echo "No Go and no release binary for $(uname -m): omarchy pkg add go" >&2
-    exit 1
-    ;;
-  esac
-  echo "Downloading based (no Go found)…"
-  curl -fsSL -o "$BIN_DIR/based.new" "https://github.com/$REPO/releases/latest/download/based-linux-$arch"
-  chmod +x "$BIN_DIR/based.new"
-  mv "$BIN_DIR/based.new" "$BIN_DIR/based"
-fi
+echo "Building based…"
+mkdir -p "$BIN_DIR"
+"${GO[@]}" build -trimpath -ldflags "-s -w" -o "$BIN_DIR/based" ./cmd/based
 
 echo "Installing bar widget…"
 changed=0
