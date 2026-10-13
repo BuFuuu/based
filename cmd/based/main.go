@@ -93,26 +93,30 @@ func cmdScan(args []string) error {
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	deep := fs.Bool("deep", false, "hash every package file instead of checking size and mtime first")
 	plain := fs.Bool("plain", false, "no animation, plain progress lines")
-	asRoot := fs.Bool("sudo", false, "re-run through sudo for full coverage (sudo's PATH lacks ~/.local/bin)")
+	asRoot := fs.Bool("sudo", false, "scan as root for full coverage; your own process saves the result")
+	emit := fs.Bool("emit", false, "internal: scan and print the result as JSON instead of saving it")
+	prevArg := fs.String("prev", "", "internal: items per phase in the last scan, as JSON, for the progress bars")
 	parse(fs, args)
+
+	if *emit {
+		// The root half of `based scan --sudo`: it reads the system and
+		// prints its findings. It never opens the user's state folder, so
+		// nothing the user (or malware running as the user) put there can
+		// make root write to or hand over files.
+		ui.UseTerminal(os.Stderr)
+		ui.SetupColor(false)
+		prevCounts := map[string]int{}
+		json.Unmarshal([]byte(*prevArg), &prevCounts)
+		snap, aborted, err := runScan(*deep, *plain, prevCounts, os.Stderr)
+		if err != nil || aborted {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(snap)
+	}
+
 	ui.SetupColor(false)
-	if *asRoot && os.Geteuid() != 0 {
-		exe, err := os.Executable()
-		if err != nil {
-			return err
-		}
-		argv := []string{"sudo", exe, "scan"}
-		if *deep {
-			argv = append(argv, "--deep")
-		}
-		if *plain {
-			argv = append(argv, "--plain")
-		}
-		sudo, err := exec.LookPath("sudo")
-		if err != nil {
-			return err
-		}
-		return syscall.Exec(sudo, argv, os.Environ())
+	if os.Geteuid() == 0 && os.Getenv("SUDO_USER") != "" {
+		return fmt.Errorf("run `based scan --sudo` as yourself: the scan runs as root, but your own process saves the result")
 	}
 	if p := os.Getenv("BASED_CPUPROFILE"); p != "" {
 		if f, err := os.Create(p); err == nil {
@@ -132,8 +136,83 @@ func cmdScan(args []string) error {
 	}
 	seen := st.Seen()
 
+	var snap *store.Snapshot
+	aborted := false
+	if *asRoot && os.Geteuid() != 0 {
+		snap, aborted, err = scanAsRoot(*deep, *plain, prevCounts)
+	} else {
+		snap, aborted, err = runScan(*deep, *plain, prevCounts, os.Stdout)
+	}
+	if err != nil {
+		return err
+	}
+	if aborted || snap == nil {
+		fmt.Println("  scan aborted, nothing saved")
+		return nil
+	}
+
+	newIDs := map[string]bool{}
+	if prev != nil {
+		for _, f := range snap.Findings {
+			if _, ok := seen[f.ID]; !ok {
+				newIDs[f.ID] = true
+			}
+		}
+	}
+	if err := st.Save(snap); err != nil {
+		return fmt.Errorf("saving snapshot: %w", err)
+	}
+	ui.ScanSummary(os.Stdout, snap, st.Accepted(), newIDs)
+	if path, err := ui.WriteReport(st, snap, st.Accepted()); err == nil {
+		fmt.Printf("  Report: %s\n\n", path)
+	}
+	return nil
+}
+
+// scanAsRoot runs `sudo based scan --emit` and reads its result. Root only
+// reads the system; this process, running as you, saves what it found.
+func scanAsRoot(deep, plain bool, prevCounts map[string]int) (*store.Snapshot, bool, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, false, err
+	}
+	sudo, err := exec.LookPath("sudo")
+	if err != nil {
+		return nil, false, err
+	}
+	prev, _ := json.Marshal(prevCounts)
+	argv := []string{exe, "scan", "--emit", "--prev", string(prev)} // sudo's PATH lacks ~/.local/bin
+	if deep {
+		argv = append(argv, "--deep")
+	}
+	if plain {
+		argv = append(argv, "--plain")
+	}
+	cmd := exec.Command(sudo, argv...)
+	cmd.Stdin, cmd.Stderr = os.Stdin, os.Stderr // the password prompt and the progress screen
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	runErr := cmd.Run()
+	if out.Len() == 0 {
+		if runErr != nil {
+			if _, ok := runErr.(*exec.ExitError); ok {
+				return nil, true, nil // sudo refused, or the scan was aborted
+			}
+			return nil, false, runErr
+		}
+		return nil, true, nil
+	}
+	var snap store.Snapshot
+	if err := json.Unmarshal(out.Bytes(), &snap); err != nil {
+		return nil, false, fmt.Errorf("reading the root scan's result: %w", err)
+	}
+	return &snap, false, nil
+}
+
+// runScan scans the system and returns what it found. Progress goes to w.
+func runScan(deep, plain bool, prevCounts map[string]int, w io.Writer) (*store.Snapshot, bool, error) {
 	env := scan.NewEnv()
-	env.Deep = *deep
+	env.Deep = deep
 	cs := collectors.All()
 	progress := scan.NewProgress(cs)
 
@@ -141,6 +220,7 @@ func cmdScan(args []string) error {
 	defer cancel()
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sig)
 	go func() { <-sig; cancel() }()
 
 	who := "user " + os.Getenv("USER")
@@ -148,25 +228,25 @@ func cmdScan(args []string) error {
 		who = "root"
 	}
 	subtitle := fmt.Sprintf("%s · %s · %s", who, hostname(), time.Now().Format("2006-01-02 15:04"))
-	if *deep {
+	if deep {
 		subtitle += " · deep"
 	}
 
 	start := time.Now()
 	aborted := false
-	if ui.IsTTY() && !*plain {
+	if ui.IsTTY() && !plain {
 		m := ui.NewScanModel(progress, subtitle, cancel)
-		prog := tea.NewProgram(m, tea.WithInput(os.Stdin))
+		prog := tea.NewProgram(m, tea.WithInput(os.Stdin), tea.WithOutput(w))
 		go func() {
 			scan.Run(ctx, env, cs, progress, prevCounts)
 			prog.Send(ui.Done())
 		}()
 		if _, err := prog.Run(); err != nil {
-			return err
+			return nil, false, err
 		}
 		aborted = m.Aborted() || ctx.Err() != nil
 	} else {
-		fmt.Printf("based scan · %s\n", subtitle)
+		fmt.Fprintf(w, "based scan · %s\n", subtitle)
 		done := make(chan struct{})
 		go func() { scan.Run(ctx, env, cs, progress, prevCounts); close(done) }()
 		printed := map[int]bool{}
@@ -183,15 +263,14 @@ func cmdScan(args []string) error {
 					if s == scan.PhaseFailed {
 						status = fmt.Sprint("failed: ", ph.Err)
 					}
-					fmt.Printf("  %-18s %s  %-60s %s\n", ph.Title, status, ph.Note, ph.Finished.Sub(ph.Started).Round(time.Millisecond))
+					fmt.Fprintf(w, "  %-18s %s  %-60s %s\n", ph.Title, status, ph.Note, ph.Finished.Sub(ph.Started).Round(time.Millisecond))
 				}
 			}
 		}
 		aborted = ctx.Err() != nil
 	}
 	if aborted {
-		fmt.Println("  scan aborted, nothing saved")
-		return nil
+		return nil, true, nil
 	}
 
 	snap := &store.Snapshot{
@@ -215,22 +294,7 @@ func cmdScan(args []string) error {
 			snap.Stats[k] += v
 		}
 	}
-	newIDs := map[string]bool{}
-	if prev != nil {
-		for _, f := range snap.Findings {
-			if _, ok := seen[f.ID]; !ok {
-				newIDs[f.ID] = true
-			}
-		}
-	}
-	if err := st.Save(snap); err != nil {
-		return fmt.Errorf("saving snapshot: %w", err)
-	}
-	ui.ScanSummary(os.Stdout, snap, st.Accepted(), newIDs)
-	if path, err := ui.WriteReport(st, snap, st.Accepted()); err == nil {
-		fmt.Printf("  Report: %s\n\n", path)
-	}
-	return nil
+	return snap, false, nil
 }
 
 func loadLatest() (*store.Store, *store.Snapshot, error) {

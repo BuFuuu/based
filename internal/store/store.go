@@ -8,16 +8,17 @@
 package store
 
 import (
+	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
-	"os/user"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/BuFuuu/based/internal/model"
@@ -57,42 +58,53 @@ type Summary struct {
 	Top       string    `json:"top"` // worst severity with open items: high, med, low, info, clean
 }
 
+// Store lives in the state folder of the user running the process. A root
+// scan never opens it: the root process only scans and hands its result to
+// the user's own process (see `based scan --sudo`), so nothing here ever
+// writes into a user's files with root's rights.
 type Store struct {
-	Dir      string
-	uid, gid int // chown target when running under sudo
+	Dir string
 }
 
-// Open returns the store for the invoking user (the SUDO_USER under sudo).
+// Open returns the store of the user running this process.
 func Open() (*Store, error) {
-	s := &Store{uid: -1, gid: -1}
 	base := os.Getenv("XDG_STATE_HOME")
-	home, _ := os.UserHomeDir()
-	if su := os.Getenv("SUDO_USER"); os.Geteuid() == 0 && su != "" {
-		if u, err := user.Lookup(su); err == nil {
-			home, base = u.HomeDir, ""
-			s.uid, _ = strconv.Atoi(u.Uid)
-			s.gid, _ = strconv.Atoi(u.Gid)
-		}
-	}
 	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
 		base = filepath.Join(home, ".local", "state")
 	}
-	s.Dir = filepath.Join(base, "based")
-	return s, s.mkdir(filepath.Join(s.Dir, "snapshots"))
-}
-
-func (s *Store) mkdir(dir string) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
+	s := &Store{Dir: filepath.Join(base, "based")}
+	if os.Geteuid() == 0 {
+		if err := rootSafe(s.Dir); err != nil {
+			return nil, err
+		}
 	}
-	s.chown(filepath.Dir(dir))
-	s.chown(dir)
-	return nil
+	return s, os.MkdirAll(filepath.Join(s.Dir, "snapshots"), 0o700)
 }
 
-func (s *Store) chown(path string) {
-	if s.uid >= 0 {
-		os.Chown(path, s.uid, s.gid)
+// rootSafe refuses a state folder that root must not write into: one with
+// a symlink or a folder owned by another user on the way, as with
+// `sudo -E`, which keeps the user's HOME. Root's own state folder passes.
+func rootSafe(dir string) error {
+	for p := filepath.Clean(dir); ; p = filepath.Dir(p) {
+		info, err := os.Lstat(p)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+		case err != nil:
+			return err
+		case info.Mode()&fs.ModeSymlink != 0:
+			return fmt.Errorf("refusing to write %s as root: %s is a symlink", dir, p)
+		default:
+			if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Uid != 0 {
+				return fmt.Errorf("refusing to write %s as root: %s belongs to another user; run based as yourself", dir, p)
+			}
+		}
+		if p == "/" {
+			return nil
+		}
 	}
 }
 
@@ -111,12 +123,25 @@ func (s *Store) writeJSON(name string, v any) error {
 	if err != nil {
 		return err
 	}
-	tmp := s.path(name + ".tmp")
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	return s.writeFile(s.path(name), b)
+}
+
+// writeFile replaces a file atomically through a temporary file with an
+// unpredictable name in the same folder.
+func (s *Store) writeFile(path string, b []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
+	if err != nil {
 		return err
 	}
-	s.chown(tmp)
-	return os.Rename(tmp, s.path(name))
+	_, werr := f.Write(b)
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		os.Remove(f.Name())
+		return werr
+	}
+	return os.Rename(f.Name(), path)
 }
 
 // Latest loads the most recent snapshot. It returns (nil, nil) if no scan
@@ -250,16 +275,14 @@ func (s *Store) Save(snap *Snapshot) error {
 }
 
 func (s *Store) archive(prev *Snapshot) {
-	name := filepath.Join(s.Dir, "snapshots", prev.ScannedAt.Format("2006-01-02T15-04-05")+".json.gz")
-	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return
-	}
-	zw := gzip.NewWriter(f)
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
 	json.NewEncoder(zw).Encode(prev)
 	zw.Close()
-	f.Close()
-	s.chown(name)
+	name := filepath.Join(s.Dir, "snapshots", prev.ScannedAt.UTC().Format("2006-01-02T15-04-05")+".json.gz")
+	if err := s.writeFile(name, buf.Bytes()); err != nil {
+		return
+	}
 
 	old, _ := filepath.Glob(filepath.Join(s.Dir, "snapshots", "*.json.gz"))
 	sort.Strings(old)
@@ -277,13 +300,12 @@ func (s *Store) ReportPath(snap *Snapshot) string {
 // SaveReport writes the report for a snapshot and keeps the last 20.
 func (s *Store) SaveReport(snap *Snapshot, content []byte) (string, error) {
 	path := s.ReportPath(snap)
-	if err := s.mkdir(filepath.Dir(path)); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(path, content, 0o600); err != nil {
+	if err := s.writeFile(path, content); err != nil {
 		return "", err
 	}
-	s.chown(path)
 	old, _ := filepath.Glob(filepath.Join(s.Dir, "reports", "based-report-*.md"))
 	sort.Strings(old)
 	for len(old) > keepSnapshots {

@@ -8,11 +8,13 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/BuFuuu/based/internal/inspect"
 	"github.com/BuFuuu/based/internal/model"
 	"github.com/BuFuuu/based/internal/pacman"
 )
@@ -80,8 +82,21 @@ func NewEnv() *Env {
 	}
 	env.Home, _ = os.UserHomeDir()
 	if su := os.Getenv("SUDO_USER"); env.IsRoot && su != "" {
+		// a root scan for this user: scan their home, and share with them
+		// only contents they could read themselves
 		if u, err := user.Lookup(su); err == nil {
 			env.Home = u.HomeDir
+			uid, _ := strconv.Atoi(u.Uid)
+			var gids []int
+			ids, _ := u.GroupIds()
+			for _, g := range ids {
+				if n, err := strconv.Atoi(g); err == nil {
+					gids = append(gids, n)
+				}
+			}
+			inspect.LimitContentTo(uid, gids)
+		} else {
+			inspect.LimitContentTo(65534, nil) // unknown user: share only what anyone could read
 		}
 	}
 	env.Home = filepath.Clean(env.Home)

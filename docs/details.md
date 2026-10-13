@@ -59,7 +59,7 @@ lowest level shown.
 | Needs | Omarchy with Hyprland, a terminal via `xdg-terminal-exec` (Omarchy's default), `wl-copy` for copying, pacman, and Go 1.27+ to build it (`omarchy pkg add go`). |
 | Reads | your files and the system's files, the pacman database, and `/proc` for programs and network connections. |
 | Writes | only `~/.local/state/based` (scans, accepts, reports), `~/.local/bin/based` and its plugin folder. |
-| Root | only when you ask: `based scan --sudo` or `R` runs the scan through `sudo`, which asks for your password. It still writes only to your own state folder. |
+| Root | only when you ask: `based scan --sudo` or `R`. Root only reads: it scans in a separate process started through `sudo` (which asks for your password) and hands the result to your own process, which saves it. Root never writes into your files, and the result holds no file contents you couldn't read yourself. |
 | Network | none. Based never uploads, downloads or looks anything up. `install.sh` builds from the files you cloned. |
 | Desktop | opening the window adds a Hyprland rule that floats and sizes it. When the bar icon changes, `install.sh` restarts the Omarchy shell so it loads the new one. |
 

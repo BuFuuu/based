@@ -266,8 +266,10 @@ func addedLines(file, template string) []string {
 	return out
 }
 
+// readLines and readFileSmall read contents that may end up in the result;
+// a root scan only shares what its user could read (see inspect.ReadFile).
 func readLines(path string) []string {
-	b, err := os.ReadFile(path)
+	b, err := inspect.ReadFile(path, 8<<20)
 	if err != nil {
 		return nil
 	}
@@ -472,7 +474,7 @@ func (c *Persistence) findUnit(name, scope string) string {
 var execRe = regexp.MustCompile(`(?m)^\s*(ExecStart|ExecStartPre|ExecStartPost)\s*=\s*(.+)$`)
 
 func unitExec(path string) (runs string, asRoot bool) {
-	b, err := os.ReadFile(path)
+	b, err := inspect.ReadFile(path, 1<<20)
 	if err != nil {
 		return "", false
 	}
@@ -486,7 +488,7 @@ func unitExec(path string) (runs string, asRoot bool) {
 
 func (c *Persistence) systemd(dir, scope string) {
 	mech := "systemd (" + scope + ")"
-	ents, err := os.ReadDir(dir)
+	ents, err := c.readDir(dir)
 	if err != nil {
 		if isPerm(err) {
 			c.unreadable(mech, dir)
@@ -503,7 +505,7 @@ func (c *Persistence) systemd(dir, scope string) {
 			}
 			c.enabled(mech, scope, p, e.Name(), filepath.Base(target), "alias")
 		case e.IsDir() && (strings.HasSuffix(e.Name(), ".wants") || strings.HasSuffix(e.Name(), ".requires") || strings.HasSuffix(e.Name(), ".upholds")):
-			kids, err := os.ReadDir(p)
+			kids, err := c.readDir(p)
 			if err != nil {
 				c.unreadable(mech, p)
 				continue
@@ -517,7 +519,7 @@ func (c *Persistence) systemd(dir, scope string) {
 				c.enabled(mech, scope, kp, k.Name(), filepath.Base(target), "started by "+strings.TrimSuffix(strings.TrimSuffix(e.Name(), ".wants"), ".requires"))
 			}
 		case e.IsDir() && strings.HasSuffix(e.Name(), ".d"):
-			kids, err := os.ReadDir(p)
+			kids, err := c.readDir(p)
 			if err != nil {
 				c.unreadable(mech, p)
 				continue
@@ -638,7 +640,7 @@ func (c *Persistence) systemFile(mech, path, runs string, extra ...model.Flag) {
 }
 
 func (c *Persistence) eachFile(dir string, fn func(path string)) {
-	ents, err := os.ReadDir(dir)
+	ents, err := c.readDir(dir)
 	if err != nil {
 		if isPerm(err) {
 			c.unreadable(mechanismFor(dir), dir)
@@ -737,7 +739,7 @@ func readFileSmall(path string) []byte {
 	if err != nil || info.Size() > 1<<20 {
 		return nil
 	}
-	b, _ := os.ReadFile(path)
+	b, _ := inspect.ReadFile(path, 1<<20)
 	return b
 }
 
@@ -757,7 +759,7 @@ func (c *Persistence) hyprland() {
 			Runs: strings.Join(runs, " ; "), Why: "part of Omarchy"}, nil, "")
 	}
 	dir := filepath.Join(c.env.Home, ".config/hypr")
-	ents, _ := os.ReadDir(dir)
+	ents, _ := c.readDir(dir)
 	for _, e := range ents {
 		n := e.Name()
 		if e.IsDir() || !(strings.HasSuffix(n, ".lua") || strings.HasSuffix(n, ".conf")) {
@@ -862,7 +864,7 @@ func (c *Persistence) omarchyHooks() {
 
 func (c *Persistence) omarchyPlugins() {
 	dir := filepath.Join(c.env.Home, ".config/omarchy/plugins")
-	ents, _ := os.ReadDir(dir)
+	ents, _ := c.readDir(dir)
 	for _, e := range ents {
 		if !e.IsDir() {
 			continue
@@ -1000,7 +1002,7 @@ func (c *Persistence) agents() {
 			URL     string   `json:"url"`
 		} `json:"mcpServers"`
 	}
-	if b, err := os.ReadFile(cfg); err == nil && json.Unmarshal(b, &cj) == nil {
+	if b, err := inspect.ReadFile(cfg, 8<<20); err == nil && json.Unmarshal(b, &cj) == nil {
 		for name, m := range cj.MCP {
 			runs := strings.TrimSpace(m.Command + " " + strings.Join(m.Args, " "))
 			if runs == "" {
@@ -1017,6 +1019,9 @@ func (c *Persistence) agents() {
 		return
 	}
 	defer f.Close()
+	if !inspect.Shareable(f) {
+		return
+	}
 	sc := bufio.NewScanner(f)
 	section := ""
 	for sc.Scan() {
@@ -1062,7 +1067,7 @@ func (c *Persistence) sessionEnv() {
 	for _, n := range []string{"env", "env-hyprland"} {
 		files = append(files, filepath.Join(home, ".config/uwsm", n))
 	}
-	if ents, err := os.ReadDir(filepath.Join(home, ".config/uwsm/env.d")); err == nil {
+	if ents, err := c.readDir(filepath.Join(home, ".config/uwsm/env.d")); err == nil {
 		for _, e := range ents {
 			files = append(files, filepath.Join(home, ".config/uwsm/env.d", e.Name()))
 		}
@@ -1192,7 +1197,8 @@ func (c *Persistence) accounts() {
 		me = userName(int(info.Sys().(*syscall.Stat_t).Uid))
 	}
 	empty := map[string]bool{}
-	for _, l := range readLines("/etc/shadow") { // root scans only
+	shadow, _ := os.ReadFile("/etc/shadow") // root scans only; only "empty or not" leaves this function
+	for _, l := range strings.Split(string(shadow), "\n") {
 		if f := strings.Split(l, ":"); len(f) > 1 && f[1] == "" {
 			empty[f[0]] = true
 		}
@@ -1331,4 +1337,22 @@ func (c *Persistence) findEmbedding(path string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// readDir lists a folder. In your home, a root scan lists only folders you
+// could list yourself, so a link planted there (~/.config/autostart ->
+// /root) can't make it report another user's file names.
+func (c *Persistence) readDir(dir string) ([]fs.DirEntry, error) {
+	if strings.HasPrefix(dir, c.env.Home+"/") {
+		d, err := os.Open(dir)
+		if err != nil {
+			return nil, err
+		}
+		shared := inspect.Shareable(d)
+		d.Close()
+		if !shared {
+			return nil, fs.ErrPermission
+		}
+	}
+	return os.ReadDir(dir)
 }

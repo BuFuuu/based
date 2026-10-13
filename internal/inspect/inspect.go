@@ -10,6 +10,7 @@ import (
 	"debug/elf"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"io"
 	"io/fs"
 	"os"
@@ -75,15 +76,80 @@ type Result struct {
 	Header      []byte
 }
 
+// A root scan hands its result to the user who started it. File contents
+// in that result (previews, commands, settings) must come only from files
+// that user could read anyway; otherwise a link planted in their home could
+// make root copy out /etc/shadow. Checks run on the opened file, so links
+// can't trick them. revealUID < 0 means no limit: a scan as yourself, or
+// root keeping its own result.
+var (
+	revealUID  = -1
+	revealGIDs map[uint32]bool
+)
+
+// LimitContentTo restricts file contents in the result to what this user
+// could read.
+func LimitContentTo(uid int, gids []int) {
+	revealUID = uid
+	revealGIDs = map[uint32]bool{}
+	for _, g := range gids {
+		revealGIDs[uint32(g)] = true
+	}
+}
+
+// ErrNotYours is returned for a file whose contents the user may not see.
+var ErrNotYours = errors.New("not readable by the user the scan reports to")
+
+// Shareable reports whether the user the scan reports to could read the
+// file behind an open handle.
+func Shareable(f *os.File) bool {
+	if revealUID < 0 {
+		return true
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	perm := info.Mode().Perm()
+	switch {
+	case int(st.Uid) == revealUID:
+		return perm&0o400 != 0
+	case revealGIDs[st.Gid]:
+		return perm&0o040 != 0
+	}
+	return perm&0o004 != 0
+}
+
+// ReadFile reads up to max bytes of a file for the result, honouring
+// LimitContentTo.
+func ReadFile(path string, max int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if !Shareable(f) {
+		return nil, ErrNotYours
+	}
+	return io.ReadAll(io.LimitReader(f, max))
+}
+
 // Inspect reads the start of a regular file and classifies it. Files larger
 // than maxScript bytes are not pattern-scanned.
-func Inspect(path string, size int64) Result {
-	var r Result
+func Inspect(path string, size int64) (r Result) {
 	f, err := os.Open(path)
 	if err != nil {
 		return r
 	}
 	defer f.Close()
+	if !Shareable(f) {
+		// classify it, but keep its contents out of the result
+		defer func() { r.Header, r.Preview, r.Patterns = nil, "", nil }()
+	}
 	buf := make([]byte, headerSize)
 	n, _ := io.ReadFull(f, buf)
 	buf = buf[:n]

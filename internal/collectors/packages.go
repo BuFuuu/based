@@ -109,6 +109,9 @@ func readList(path string) []string {
 		return nil
 	}
 	defer f.Close()
+	if !inspect.Shareable(f) {
+		return nil
+	}
 	var out []string
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {

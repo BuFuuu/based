@@ -197,7 +197,9 @@ func (c *SystemFiles) unownedVarDir(path string, r *scan.Reporter) {
 		f.SetFact("owner", inspect.Owner(info))
 		f.SetFact("mode", inspect.ModeString(info.Mode()))
 	}
-	if ents, err := os.ReadDir(path); err == nil {
+	if !shareableDir(path) {
+		f.SetFact("entries", "not listable by the user this scan reports to")
+	} else if ents, err := os.ReadDir(path); err == nil {
 		f.SetFact("entries", num(len(ents)))
 		var names []string
 		for i, e := range ents {
@@ -558,4 +560,15 @@ func securityConfig(path string) bool {
 		return true
 	}
 	return false
+}
+
+// shareableDir reports whether the user a root scan reports to could list
+// this folder, so its file names may appear in the result.
+func shareableDir(path string) bool {
+	d, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer d.Close()
+	return inspect.Shareable(d)
 }

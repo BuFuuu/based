@@ -51,10 +51,17 @@ func SetupColor(force bool) {
 	}
 }
 
-func IsTTY() bool { return term.IsTerminal(os.Stdout.Fd()) }
+// termOut is the terminal the screens draw on: stdout, or stderr for a root
+// scan whose stdout carries its result to the user's process.
+var termOut = os.Stdout
+
+// UseTerminal makes the screens draw on f.
+func UseTerminal(f *os.File) { termOut = f }
+
+func IsTTY() bool { return term.IsTerminal(termOut.Fd()) }
 
 func Width() int {
-	w, _, err := term.GetSize(os.Stdout.Fd())
+	w, _, err := term.GetSize(termOut.Fd())
 	if err != nil || w <= 0 {
 		return 100
 	}
@@ -62,7 +69,7 @@ func Width() int {
 }
 
 func Height() int {
-	_, h, err := term.GetSize(os.Stdout.Fd())
+	_, h, err := term.GetSize(termOut.Fd())
 	if err != nil || h <= 0 {
 		return 40
 	}
