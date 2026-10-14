@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -59,33 +60,56 @@ func (c *Persistence) Collect(ctx context.Context, env *scan.Env, r *scan.Report
 	c.loadPresets()
 	c.loadUnitRelations()
 	home := env.Home
-	steps := []func(){
-		func() { c.systemd("/etc/systemd/system", "system") },
-		func() { c.systemd("/etc/systemd/user", "all users") },
-		func() { c.systemd(filepath.Join(home, ".config/systemd/user"), "user") },
-		func() { c.systemd(filepath.Join(home, ".local/share/systemd/user"), "user") },
-		c.cron,
-		c.autostart,
-		c.hyprland,
-		c.shellStartup,
-		c.pacmanHooks,
-		c.omarchyHooks,
-		c.omarchyPlugins,
-		c.systemHooks,
-		c.ssh,
-		c.agents,
-		c.git,
-		c.sessionEnv,
-		c.dbusServices,
-		c.launchers,
-		c.pythonHooks,
-		c.accounts,
+	steps := []struct {
+		inHome bool
+		run    func()
+	}{
+		{false, func() { c.systemd("/etc/systemd/system", "system") }},
+		{false, func() { c.systemd("/etc/systemd/user", "all users") }},
+		{true, func() { c.systemd(filepath.Join(home, ".config/systemd/user"), "user") }},
+		{true, func() { c.systemd(filepath.Join(home, ".local/share/systemd/user"), "user") }},
+		{false, c.cron},
+		{false, c.systemAutostart},
+		{true, c.homeAutostart},
+		{true, c.hyprland},
+		{true, c.homeShellStartup},
+		{false, c.systemShellStartup},
+		{false, c.pacmanHooks},
+		{true, c.omarchyHooks},
+		{true, c.omarchyPlugins},
+		{false, c.systemHooks},
+		{true, c.ssh},
+		{true, c.agents},
+		{true, c.git},
+		{true, c.sessionEnv},
+		{true, c.dbusServices},
+		{true, c.launchers},
+		{true, c.pythonHooks},
+		{false, c.accounts},
 	}
 	for _, step := range steps {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		step()
+		// a root scan for a user leaves their home to the helper that runs
+		// as them (see scan.UserPart); the helper does only the home
+		if (step.inHome && env.UserPart != nil) || (!step.inHome && env.HomeOnly) {
+			continue
+		}
+		step.run()
+	}
+	if env.UserPart != nil {
+		res, err := env.UserPart.Result(ctx, c.ID())
+		if err != nil {
+			return fmt.Errorf("the persistence in your home: %w", err)
+		}
+		r.Merge(res)
+		for _, e := range res.Entries {
+			c.total++
+			if e.State == "flagged" {
+				c.flags++
+			}
+		}
 	}
 	r.Note(fmt.Sprintf("%d entries · %d not default", c.total, c.flags))
 	return nil
@@ -96,12 +120,29 @@ func (c *Persistence) Collect(ctx context.Context, env *scan.Env, r *scan.Report
 // add records an entry. Without flags it is a default; with flags it is
 // flagged and reported as a finding.
 func (c *Persistence) add(e model.Entry, flags []model.Flag, preview string) {
+	c.addFrom(e.Path, e, flags, preview)
+}
+
+// hiddenText stands in for what a file says when the user a root scan
+// reports to couldn't read it.
+const hiddenText = "(hidden: only root can read this file)"
+
+// addFrom is add for an entry whose text (what it runs, the preview) comes
+// from the file src. If the user a root scan reports to couldn't read src,
+// the entry keeps its verdict (flags, why it is listed) but not the text.
+func (c *Persistence) addFrom(src string, e model.Entry, flags []model.Flag, preview string) {
 	c.total++
 	c.r.Tick(e.Path, "autostart")
 	if len(flags) > 0 && e.State != "unreadable" {
 		if by, ok := c.shippedBy(e.Runs); ok {
 			e.Why, flags = by, nil
 		}
+	}
+	if src != "" && e.State != "unreadable" && !inspect.Shared(src) {
+		if e.Runs != "" {
+			e.Runs = hiddenText
+		}
+		preview = ""
 	}
 	if e.State == "unreadable" || len(flags) == 0 {
 		if e.State == "" {
@@ -129,7 +170,7 @@ func (c *Persistence) add(e model.Entry, flags []model.Flag, preview string) {
 	f.SetFact("name", e.Name)
 	f.SetFact("runs", e.Runs)
 	f.SetFact("why listed", e.Why)
-	sum := sha256.Sum256([]byte(e.Runs + "\x00" + preview + "\x00" + fingerprintFile(e.Path)))
+	sum := sha256.Sum256([]byte(e.Runs + "\x00" + preview + "\x00" + fingerprintFile(src)))
 	f.Fingerprint = hex.EncodeToString(sum[:8])
 	if e.Why == "" {
 		e.Why = flags[0].Label
@@ -143,20 +184,45 @@ func withTimes(f model.Finding, path string, info fs.FileInfo) model.Finding {
 	return base
 }
 
+// fingerprintFile tells when a file changes. For a file the user couldn't
+// read it is not the contents' hash, which would let them confirm a guess,
+// but its size and times; any edit changes the change time.
 func fingerprintFile(path string) string {
 	info, err := os.Stat(path)
 	if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
 		return ""
 	}
-	if h, err := inspect.SHA256(path); err == nil {
+	if h := inspect.SharedSHA256(path); h != "" {
 		return h
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return fmt.Sprintf("%d:%d:%d", info.Size(), info.ModTime().UnixNano(), st.Ctim.Nano())
 	}
 	return ""
 }
 
 func (c *Persistence) unreadable(mech, path string) {
-	c.add(model.Entry{Mechanism: mech, Name: path, Path: path, State: "unreadable",
-		Why: "not readable as your user: `based scan --sudo`"}, nil, "")
+	why := "not readable as your user: `based scan --sudo`"
+	if strings.HasPrefix(path, c.env.Home+"/") {
+		// read by your own programs (shell, desktop, systemd --user, ssh):
+		// what they can't read, they can't run
+		why = "you can't read it, so it can't run as you"
+	}
+	c.add(model.Entry{Mechanism: mech, Name: path, Path: path, State: "unreadable", Why: why}, nil, "")
+}
+
+// readableHome reports whether a file in home that exists can be read. If
+// it can't, it is listed as unreadable rather than judged as empty.
+func (c *Persistence) readableHome(mech, path string) bool {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err == nil {
+		f.Close()
+		return true
+	}
+	if isPerm(err) {
+		c.unreadable(mech, path)
+	}
+	return false
 }
 
 // ---- deciding what is default --------------------------------------------
@@ -266,14 +332,34 @@ func addedLines(file, template string) []string {
 	return out
 }
 
-// readLines and readFileSmall read contents that may end up in the result;
-// a root scan only shares what its user could read (see inspect.ReadFile).
+// readLines and readFileSmall read a file to judge it. In a root scan that
+// includes files its user couldn't read, so what they return reaches the
+// result only through addFrom, which then keeps it out (see inspect.Read).
 func readLines(path string) []string {
+	b, _, err := inspect.Read(path, 8<<20)
+	if err != nil {
+		return nil
+	}
+	return strings.Split(string(b), "\n")
+}
+
+// sharedLines and sharedSmall read contents that go into the result as
+// they are: only what the user could read themselves.
+func sharedLines(path string) []string {
 	b, err := inspect.ReadFile(path, 8<<20)
 	if err != nil {
 		return nil
 	}
 	return strings.Split(string(b), "\n")
+}
+
+func sharedSmall(path string) []byte {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() > 1<<20 {
+		return nil
+	}
+	b, _ := inspect.ReadFile(path, 1<<20)
+	return b
 }
 
 // oddExec reports whether a command runs a program from an unusual place.
@@ -474,7 +560,7 @@ func (c *Persistence) findUnit(name, scope string) string {
 var execRe = regexp.MustCompile(`(?m)^\s*(ExecStart|ExecStartPre|ExecStartPost)\s*=\s*(.+)$`)
 
 func unitExec(path string) (runs string, asRoot bool) {
-	b, err := inspect.ReadFile(path, 1<<20)
+	b, _, err := inspect.Read(path, 1<<20)
 	if err != nil {
 		return "", false
 	}
@@ -565,7 +651,7 @@ func (c *Persistence) enabled(mech, scope, link, name, target, how string) {
 	if unit != "" {
 		content = headOf(unit, 60)
 	}
-	c.add(e, c.contentFlags(flags, runs, content), content)
+	c.addFrom(unit, e, c.contentFlags(flags, runs, content), content)
 }
 
 func (c *Persistence) omarchyEnabled(names ...string) bool { return c.omarchyScript(names...) != "" }
@@ -647,11 +733,16 @@ func (c *Persistence) eachFile(dir string, fn func(path string)) {
 		}
 		return
 	}
+	home := strings.HasPrefix(dir, c.env.Home+"/")
 	for _, e := range ents {
 		if e.IsDir() {
 			continue
 		}
-		fn(filepath.Join(dir, e.Name()))
+		p := filepath.Join(dir, e.Name())
+		if home && !c.readableHome(mechanismFor(dir), p) {
+			continue
+		}
+		fn(p)
 	}
 }
 
@@ -665,6 +756,18 @@ func mechanismFor(dir string) string {
 		return "polkit rule (permissions)"
 	case strings.Contains(dir, "cron"):
 		return "cron"
+	case strings.HasSuffix(dir, "/autostart"):
+		return "autostart"
+	case strings.HasSuffix(dir, "/environment.d"):
+		return "session environment"
+	case strings.HasSuffix(dir, "/fish/conf.d"):
+		return "shell startup"
+	case strings.HasSuffix(dir, "/dbus-1/services"):
+		return "D-Bus service"
+	case strings.HasSuffix(dir, "/applications"):
+		return "app launcher override"
+	case strings.HasSuffix(dir, "/site-packages"):
+		return "Python startup"
 	}
 	return "other"
 }
@@ -702,7 +805,7 @@ func (c *Persistence) cron() {
 
 var desktopExec = regexp.MustCompile(`(?m)^Exec\s*=\s*(.+)$`)
 
-func (c *Persistence) autostart() {
+func (c *Persistence) systemAutostart() {
 	c.eachFile("/etc/xdg/autostart", func(p string) {
 		m := desktopExec.FindStringSubmatch(string(readFileSmall(p)))
 		runs := ""
@@ -711,6 +814,9 @@ func (c *Persistence) autostart() {
 		}
 		c.systemFile("autostart (all users)", p, runs)
 	})
+}
+
+func (c *Persistence) homeAutostart() {
 	dir := filepath.Join(c.env.Home, ".config/autostart")
 	c.eachFile(dir, func(p string) {
 		b := readFileSmall(p)
@@ -739,7 +845,7 @@ func readFileSmall(path string) []byte {
 	if err != nil || info.Size() > 1<<20 {
 		return nil
 	}
-	b, _ := inspect.ReadFile(path, 1<<20)
+	b, _, _ := inspect.Read(path, 1<<20)
 	return b
 }
 
@@ -766,6 +872,9 @@ func (c *Persistence) hyprland() {
 			continue
 		}
 		p := filepath.Join(dir, n)
+		if !c.readableHome("Hyprland startup", p) {
+			continue
+		}
 		tpl := filepath.Join(c.env.OmarchyPath, "config/hypr", n)
 		var launches []string
 		for _, l := range addedLines(p, tpl) {
@@ -787,12 +896,12 @@ func (c *Persistence) hyprland() {
 	}
 }
 
-func (c *Persistence) shellStartup() {
+func (c *Persistence) homeShellStartup() {
 	home := c.env.Home
 	templates := map[string]string{".bashrc": filepath.Join(c.env.OmarchyPath, "default/bashrc")}
 	for _, n := range []string{".bashrc", ".bash_profile", ".bash_login", ".bash_logout", ".profile", ".zshrc", ".zprofile", ".zshenv", ".xprofile", ".xinitrc", ".config/fish/config.fish"} {
 		p := filepath.Join(home, n)
-		if _, err := os.Stat(p); err != nil {
+		if _, err := os.Lstat(p); err != nil || !c.readableHome("shell startup", p) {
 			continue
 		}
 		tpl := templates[n]
@@ -811,12 +920,6 @@ func (c *Persistence) shellStartup() {
 		fl := model.FlagAddedLines
 		c.add(e, c.contentFlags([]model.Flag{fl}, "", strings.Join(added, "\n")), strings.Join(added, "\n"))
 	}
-	for _, p := range []string{"/etc/profile", "/etc/bash.bashrc", "/etc/environment", "/etc/zsh/zshrc", "/etc/zsh/zprofile"} {
-		if _, err := os.Stat(p); err == nil {
-			c.systemFile("shell startup (all users)", p, "")
-		}
-	}
-	c.eachFile("/etc/profile.d", func(p string) { c.systemFile("shell startup (all users)", p, "") })
 	envd := filepath.Join(home, ".config/environment.d")
 	c.eachFile(envd, func(p string) {
 		e := model.Entry{Mechanism: "session environment", Name: filepath.Base(p), Path: p, Runs: meaningful(p, 3)}
@@ -828,6 +931,15 @@ func (c *Persistence) shellStartup() {
 		e.Why = "sets variables for your whole session"
 		c.add(e, c.contentFlags([]model.Flag{model.FlagAddedLines}, "", headOf(p, 40)), headOf(p, 40))
 	})
+}
+
+func (c *Persistence) systemShellStartup() {
+	for _, p := range []string{"/etc/profile", "/etc/bash.bashrc", "/etc/environment", "/etc/zsh/zshrc", "/etc/zsh/zprofile"} {
+		if _, err := os.Stat(p); err == nil {
+			c.systemFile("shell startup (all users)", p, "")
+		}
+	}
+	c.eachFile("/etc/profile.d", func(p string) { c.systemFile("shell startup (all users)", p, "") })
 }
 
 var hookExec = regexp.MustCompile(`(?m)^Exec\s*=\s*(.+)$`)
@@ -846,6 +958,9 @@ func (c *Persistence) omarchyHooks() {
 	root := filepath.Join(c.env.Home, ".config/omarchy/hooks")
 	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() || strings.HasSuffix(p, ".sample") {
+			return nil
+		}
+		if !c.readableHome("Omarchy hook", p) {
 			return nil
 		}
 		rel, _ := filepath.Rel(root, p)
@@ -931,7 +1046,9 @@ func (c *Persistence) systemHooks() {
 
 func (c *Persistence) ssh() {
 	keys := filepath.Join(c.env.Home, ".ssh/authorized_keys")
-	if lines := meaningfulLines(keys); len(lines) > 0 {
+	if _, err := os.Lstat(keys); err == nil && !c.readableHome("SSH login", keys) {
+		// sshd reads it with your rights: it lets nobody in
+	} else if lines := meaningfulLines(keys); len(lines) > 0 {
 		var names []string
 		for _, l := range lines {
 			f := strings.Fields(l)
@@ -942,7 +1059,7 @@ func (c *Persistence) ssh() {
 			[]model.Flag{model.FlagSSHKeys}, strings.Join(names, "\n"))
 	}
 	rc := filepath.Join(c.env.Home, ".ssh/rc")
-	if _, err := os.Stat(rc); err == nil {
+	if _, err := os.Stat(rc); err == nil && c.readableHome("SSH login", rc) {
 		content := headOf(rc, 40)
 		c.add(model.Entry{Mechanism: "SSH login", Name: "~/.ssh/rc", Path: rc, Runs: meaningful(rc, 2),
 			Why: "runs on every SSH login"}, c.contentFlags([]model.Flag{model.FlagAutostart}, "", content), content)
@@ -959,9 +1076,21 @@ func meaningfulLines(path string) []string {
 	return out
 }
 
+// checkHome lists files in home that exist but can't be read as unreadable;
+// reading them then finds nothing.
+func (c *Persistence) checkHome(mech string, paths ...string) {
+	for _, p := range paths {
+		if _, err := os.Lstat(p); err == nil {
+			c.readableHome(mech, p)
+		}
+	}
+}
+
 func (c *Persistence) agents() {
 	// Claude Code: hooks and status line in settings.json, tool servers in ~/.claude.json.
 	settings := filepath.Join(c.env.Home, ".claude/settings.json")
+	c.checkHome("Claude Code hook", settings, filepath.Join(c.env.Home, ".claude.json"))
+	c.checkHome("Codex hook", filepath.Join(c.env.Home, ".codex/config.toml"))
 	var s struct {
 		Hooks map[string][]struct {
 			Matcher string `json:"matcher"`
@@ -1048,6 +1177,7 @@ var hooksPathRe = regexp.MustCompile(`(?mi)^\s*hookspath\s*=\s*(.+)$`)
 
 func (c *Persistence) git() {
 	for _, p := range []string{filepath.Join(c.env.Home, ".gitconfig"), filepath.Join(c.env.Home, ".config/git/config")} {
+		c.checkHome("git", p)
 		if m := hooksPathRe.FindSubmatch(readFileSmall(p)); m != nil {
 			runs := strings.TrimSpace(string(m[1]))
 			c.add(model.Entry{Mechanism: "git", Name: "core.hooksPath", Path: p, Runs: runs,
@@ -1073,7 +1203,7 @@ func (c *Persistence) sessionEnv() {
 		}
 	}
 	for _, p := range files {
-		if _, err := os.Stat(p); err != nil {
+		if _, err := os.Lstat(p); err != nil || !c.readableHome("session startup (uwsm)", p) {
 			continue
 		}
 		lines := meaningfulLines(p)
@@ -1300,14 +1430,11 @@ func (c *Persistence) embeddedIn(path string) (string, bool) {
 }
 
 func (c *Persistence) findEmbedding(path string) (string, bool) {
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() < 64 || info.Size() > 1<<20 {
-		return "", false // tiny scripts would match by chance
-	}
-	script, err := os.ReadFile(path)
-	if err != nil {
+	script, ok := readScript(path)
+	if !ok {
 		return "", false
 	}
+	size := int64(len(script))
 	rel := strings.TrimPrefix(path, c.env.Home)
 	for _, name := range regexp.MustCompile(`[A-Za-z0-9]+`).FindAllString(rel, -1) {
 		pkg := c.env.Pacman.Package(strings.ToLower(name))
@@ -1324,7 +1451,7 @@ func (c *Persistence) findEmbedding(path string) (string, bool) {
 				continue
 			}
 			fi, err := os.Stat(f)
-			if err != nil || !fi.Mode().IsRegular() || fi.Size() < info.Size() || fi.Size() > budget {
+			if err != nil || !fi.Mode().IsRegular() || fi.Size() < size || fi.Size() > budget {
 				continue
 			}
 			budget -= fi.Size()
@@ -1337,6 +1464,36 @@ func (c *Persistence) findEmbedding(path string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// readScript reads a script from home or /tmp, 64 bytes to 1 MiB (tiny
+// scripts would match by chance). A root scan follows no link to it: those
+// are places where others can plant links.
+func readScript(path string) ([]byte, bool) {
+	var f *os.File
+	if !inspect.Limited() {
+		var err error
+		if f, err = os.Open(path); err != nil {
+			return nil, false
+		}
+	} else {
+		e, err := inspect.StatNoLinks(path)
+		if err != nil {
+			return nil, false
+		}
+		f, err = e.Open()
+		e.Close()
+		if err != nil {
+			return nil, false
+		}
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() < 64 || info.Size() > 1<<20 {
+		return nil, false
+	}
+	b, err := io.ReadAll(io.LimitReader(f, 1<<20))
+	return b, err == nil
 }
 
 // readDir lists a folder. In your home, a root scan lists only folders you

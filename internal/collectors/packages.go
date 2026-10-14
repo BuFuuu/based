@@ -130,12 +130,22 @@ func truncList(xs []string, n int) string {
 	return strings.Join(xs[:n], ", ") + fmt.Sprintf(" +%d more", len(xs)-n)
 }
 
-// aurPKGBUILD finds a cached PKGBUILD from yay or paru.
+// aurPKGBUILD finds a cached PKGBUILD from yay or paru. It follows no
+// links: a root scan must not tell whether a file exists wherever a link
+// in your home points.
 func aurPKGBUILD(home, name string) string {
 	for _, dir := range []string{".cache/yay", ".cache/paru/clone"} {
 		p := filepath.Join(home, dir, name, "PKGBUILD")
-		if _, err := os.Stat(p); err == nil {
-			return p
+		if !inspect.Limited() {
+			if info, err := os.Stat(p); err == nil && info.Mode().IsRegular() {
+				return p
+			}
+		} else if e, err := inspect.StatNoLinks(p); err == nil {
+			regular := e.Info.Mode().IsRegular()
+			e.Close()
+			if regular {
+				return p
+			}
 		}
 	}
 	return ""

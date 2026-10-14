@@ -3,7 +3,6 @@ package collectors
 import (
 	"context"
 	"fmt"
-	"io/fs"
 	"path/filepath"
 
 	"github.com/BuFuuu/based/internal/inspect"
@@ -24,53 +23,48 @@ func (*TempFiles) Estimate(_ *scan.Env, prev int) int { return prev }
 func (c *TempFiles) Collect(ctx context.Context, env *scan.Env, r *scan.Reporter) error {
 	checked := 0
 	for _, root := range tempRoots {
-		filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if err != nil {
+		// anyone can write here, so any name may be a planted link: walk
+		// without following links
+		inspect.WalkNoLinks(ctx, root, func(string) bool { return true },
+			func(e *inspect.Entry) {
+				checked++
+				r.File(e.Path, model.TrustUnknown)
+				c.check(e, r)
+				r.Tick(e.Path, "temp")
+			},
+			func(path string, err error) {
 				if isPerm(err) {
 					r.Unreadable(path)
 				}
-				if d != nil && d.IsDir() && path != root {
-					return fs.SkipDir
-				}
-				return nil
-			}
-			if d.IsDir() || !d.Type().IsRegular() {
-				return nil
-			}
-			info, err := d.Info()
-			if err != nil {
-				return nil
-			}
-			checked++
-			r.File(path, model.TrustUnknown)
-			c.check(path, info, r)
-			r.Tick(path, "temp")
-			return nil
-		})
+			})
 	}
 	r.Note(fmt.Sprintf("%s files · %d runnable", num(checked), c.found))
 	return ctx.Err()
 }
 
-func (c *TempFiles) check(path string, info fs.FileInfo, r *scan.Reporter) {
-	exec := inspect.IsExecutable(info)
-	res := inspect.Inspect(path, info.Size())
+func (c *TempFiles) check(e *inspect.Entry, r *scan.Reporter) {
+	exec := inspect.IsExecutable(e.Info)
+	var res inspect.Result
+	file, err := e.Open()
+	if err == nil {
+		defer file.Close()
+		res = inspect.InspectFile(file, e.Path, e.Info.Size())
+	}
 	if !exec && res.Type != inspect.TypeELF {
 		return
 	}
 	c.found++
-	f := fileFinding(model.KindFile, path, info)
+	f := entryFinding(model.KindFile, e)
 	f.Title = "runnable file in temp"
 	f.AddFlag(model.FlagExecInTemp)
-	if inspect.IsHidden(path, filepath.Dir(filepath.Dir(path))) {
+	if inspect.IsHidden(e.Path, filepath.Dir(filepath.Dir(e.Path))) {
 		f.AddFlag(model.FlagHidden)
 	}
-	for _, fl := range inspect.ModeFlags(path, info, false) {
+	for _, fl := range e.ModeFlags(false) {
 		f.AddFlag(fl)
 	}
-	addContent(&f, path, info)
+	if file != nil {
+		addEntryContent(&f, e, file, res)
+	}
 	r.Report(f)
 }

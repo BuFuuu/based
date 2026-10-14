@@ -10,7 +10,6 @@ import (
 	"debug/elf"
 	"encoding/binary"
 	"encoding/hex"
-	"errors"
 	"io"
 	"io/fs"
 	"os"
@@ -35,6 +34,10 @@ func Times(path string) (added time.Time, source string, mtime time.Time) {
 	if err := unix.Statx(unix.AT_FDCWD, path, unix.AT_SYMLINK_NOFOLLOW, unix.STATX_BTIME|unix.STATX_CTIME|unix.STATX_MTIME, &st); err != nil {
 		return time.Time{}, "", time.Time{}
 	}
+	return statxTimes(&st)
+}
+
+func statxTimes(st *unix.Statx_t) (added time.Time, source string, mtime time.Time) {
 	mtime = time.Unix(st.Mtime.Sec, int64(st.Mtime.Nsec))
 	if st.Mask&unix.STATX_BTIME != 0 && st.Btime.Sec > 0 {
 		return time.Unix(st.Btime.Sec, int64(st.Btime.Nsec)), "created", mtime
@@ -76,82 +79,29 @@ type Result struct {
 	Header      []byte
 }
 
-// A root scan hands its result to the user who started it. File contents
-// in that result (previews, commands, settings) must come only from files
-// that user could read anyway; otherwise a link planted in their home could
-// make root copy out /etc/shadow. Checks run on the opened file, so links
-// can't trick them. revealUID < 0 means no limit: a scan as yourself, or
-// root keeping its own result.
-var (
-	revealUID  = -1
-	revealGIDs map[uint32]bool
-)
-
-// LimitContentTo restricts file contents in the result to what this user
-// could read.
-func LimitContentTo(uid int, gids []int) {
-	revealUID = uid
-	revealGIDs = map[uint32]bool{}
-	for _, g := range gids {
-		revealGIDs[uint32(g)] = true
-	}
-}
-
-// ErrNotYours is returned for a file whose contents the user may not see.
-var ErrNotYours = errors.New("not readable by the user the scan reports to")
-
-// Shareable reports whether the user the scan reports to could read the
-// file behind an open handle.
-func Shareable(f *os.File) bool {
-	if revealUID < 0 {
-		return true
-	}
-	info, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return false
-	}
-	perm := info.Mode().Perm()
-	switch {
-	case int(st.Uid) == revealUID:
-		return perm&0o400 != 0
-	case revealGIDs[st.Gid]:
-		return perm&0o040 != 0
-	}
-	return perm&0o004 != 0
-}
-
-// ReadFile reads up to max bytes of a file for the result, honouring
-// LimitContentTo.
-func ReadFile(path string, max int64) ([]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	if !Shareable(f) {
-		return nil, ErrNotYours
-	}
-	return io.ReadAll(io.LimitReader(f, max))
-}
-
 // Inspect reads the start of a regular file and classifies it. Files larger
 // than maxScript bytes are not pattern-scanned.
-func Inspect(path string, size int64) (r Result) {
-	f, err := os.Open(path)
+func Inspect(path string, size int64) Result {
+	f, err := openRead(path)
 	if err != nil {
-		return r
+		return Result{}
 	}
 	defer f.Close()
-	if !Shareable(f) {
-		// classify it, but keep its contents out of the result
-		defer func() { r.Header, r.Preview, r.Patterns = nil, "", nil }()
+	return InspectFile(f, path, size)
+}
+
+// InspectFile is Inspect on a file that is already open; path is where it
+// was found.
+func InspectFile(f *os.File, path string, size int64) (r Result) {
+	switch AccessOf(f, path) {
+	case Hidden:
+		return r
+	case Verdict:
+		// judge it, but keep what it says out of the result
+		defer func() { r.Header, r.Preview, r.Interpreter = nil, "", "" }()
 	}
 	buf := make([]byte, headerSize)
-	n, _ := io.ReadFull(f, buf)
+	n, _ := io.ReadFull(io.NewSectionReader(f, 0, headerSize), buf)
 	buf = buf[:n]
 	r.Header = buf
 	r.Type = TypeData
@@ -159,7 +109,7 @@ func Inspect(path string, size int64) (r Result) {
 	case bytes.HasPrefix(buf, []byte("\x7fELF")):
 		r.Type = TypeELF
 		r.Packed = bytes.Contains(buf, []byte("UPX!"))
-		if ef, err := elf.Open(path); err == nil {
+		if ef, err := elf.NewFile(f); err == nil {
 			r.Static = true
 			for _, p := range ef.Progs {
 				if p.Type == elf.PT_INTERP || p.Type == elf.PT_DYNAMIC {
@@ -167,7 +117,6 @@ func Inspect(path string, size int64) (r Result) {
 					break
 				}
 			}
-			ef.Close()
 		}
 	case bytes.HasPrefix(buf, []byte("#!")):
 		r.Type = TypeScript
@@ -276,6 +225,15 @@ func preview(b []byte, lines int) string {
 
 // ModeFlags inspects permission bits and ownership.
 func ModeFlags(path string, info fs.FileInfo, systemPath bool) []model.Flag {
+	return modeFlags(info, systemPath, func() bool { return HasCaps(path) })
+}
+
+// ModeFlags is ModeFlags for the entry.
+func (e *Entry) ModeFlags(systemPath bool) []model.Flag {
+	return modeFlags(e.Info, systemPath, e.HasCaps)
+}
+
+func modeFlags(info fs.FileInfo, systemPath bool, hasCaps func() bool) []model.Flag {
 	var out []model.Flag
 	m := info.Mode()
 	if m&fs.ModeSetuid != 0 {
@@ -287,7 +245,7 @@ func ModeFlags(path string, info fs.FileInfo, systemPath bool) []model.Flag {
 	if systemPath && m.Perm()&0o002 != 0 && m.IsRegular() {
 		out = append(out, model.FlagWorldWritable)
 	}
-	if m.IsRegular() && HasCaps(path) {
+	if m.IsRegular() && hasCaps() {
 		out = append(out, model.FlagCapabilities)
 	}
 	if st, ok := info.Sys().(*syscall.Stat_t); ok {

@@ -99,9 +99,19 @@ func (s *ignoreSet) match(path string, isDir bool) bool {
 
 // fileFinding builds the common part of a finding for a path on disk.
 func fileFinding(kind model.Kind, path string, info fs.FileInfo) model.Finding {
+	added, source, mtime := inspect.Times(path)
+	return timedFinding(kind, path, info, added, source, mtime)
+}
+
+// entryFinding is fileFinding for a file found without following links.
+func entryFinding(kind model.Kind, e *inspect.Entry) model.Finding {
+	added, source, mtime := e.Times()
+	return timedFinding(kind, e.Path, e.Info, added, source, mtime)
+}
+
+func timedFinding(kind model.Kind, path string, info fs.FileInfo, added time.Time, source string, mtime time.Time) model.Finding {
 	f := model.Finding{Kind: kind, Subject: path}
-	var mtime time.Time
-	f.Added, f.AddedSource, mtime = inspect.Times(path)
+	f.Added, f.AddedSource = added, source
 	if f.Added.IsZero() {
 		f.Added, f.AddedSource = info.ModTime(), "modified"
 	}
@@ -115,12 +125,31 @@ func fileFinding(kind model.Kind, path string, info fs.FileInfo) model.Finding {
 	return f
 }
 
-// addContent inspects file contents and folds the result into f.
+// addContent inspects file contents and folds the result into f. A root
+// scan adds contents and the hash only for files its user could read; for
+// the rest the fingerprint stays size and time.
 func addContent(f *model.Finding, path string, info fs.FileInfo) inspect.Result {
 	if !info.Mode().IsRegular() {
 		return inspect.Result{}
 	}
 	r := inspect.Inspect(path, info.Size())
+	addResult(f, r)
+	if info.Size() < 64<<20 {
+		addHash(f, inspect.SharedSHA256(path))
+	}
+	return r
+}
+
+// addEntryContent is addContent for a file found without following links,
+// open as file.
+func addEntryContent(f *model.Finding, e *inspect.Entry, file *os.File, r inspect.Result) {
+	addResult(f, r)
+	if e.Info.Size() < 64<<20 {
+		addHash(f, inspect.SharedSHA256File(file, e.Path))
+	}
+}
+
+func addResult(f *model.Finding, r inspect.Result) {
 	for _, fl := range r.Flags() {
 		f.AddFlag(fl)
 	}
@@ -132,13 +161,13 @@ func addContent(f *model.Finding, path string, info fs.FileInfo) inspect.Result 
 		f.SetFact("type", t)
 	}
 	f.Preview = r.Preview
-	if info.Size() < 64<<20 {
-		if sum, err := inspect.SHA256(path); err == nil {
-			f.SetFact("sha256", sum)
-			f.Fingerprint = sum
-		}
+}
+
+func addHash(f *model.Finding, sum string) {
+	if sum != "" {
+		f.SetFact("sha256", sum)
+		f.Fingerprint = sum
 	}
-	return r
 }
 
 func readlink(path string) string {

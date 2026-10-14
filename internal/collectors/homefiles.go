@@ -50,19 +50,25 @@ func (*HomeFiles) Title() string { return "Home directory" }
 
 func (*HomeFiles) Estimate(_ *scan.Env, prev int) int { return prev }
 
-func (c *HomeFiles) Collect(ctx context.Context, env *scan.Env, r *scan.Reporter) error {
-	if env.Home == "" || env.Home == "/" {
-		return fmt.Errorf("no home directory")
-	}
+func homeIgnoreSet(home string) *ignoreSet {
 	patterns := make([]string, len(homeIgnore))
 	for i, g := range homeIgnore {
 		if rest, ok := strings.CutPrefix(g, "~/"); ok {
-			g = env.Home + "/" + rest
+			g = home + "/" + rest
 		}
 		patterns[i] = g
 	}
-	ignore := newIgnoreSet(patterns)
+	return newIgnoreSet(patterns)
+}
 
+func (c *HomeFiles) Collect(ctx context.Context, env *scan.Env, r *scan.Reporter) error {
+	if env.UserPart != nil {
+		return c.fromUserPart(ctx, env, r)
+	}
+	if env.Home == "" || env.Home == "/" {
+		return fmt.Errorf("no home directory")
+	}
+	ignore := homeIgnoreSet(env.Home)
 	c.groups = map[string]*tree{}
 	if err := c.configs(ctx, env, r, ignore); err != nil {
 		return err
@@ -118,32 +124,68 @@ func (c *HomeFiles) Collect(ctx context.Context, env *scan.Env, r *scan.Reporter
 	return nil
 }
 
-func (c *HomeFiles) homeFile(env *scan.Env, path string, info fs.FileInfo, r *scan.Reporter) bool {
-	exec := inspect.IsExecutable(info)
-	hidden := inspect.IsHidden(path, env.Home)
-	inLocalBin := strings.HasPrefix(path, filepath.Join(env.Home, ".local/bin")+"/") ||
-		strings.HasPrefix(path, filepath.Join(env.Home, "bin")+"/")
+// couldRun says whether a file in home is worth reading: only files that
+// could run are.
+func couldRun(env *scan.Env, path string, info fs.FileInfo) bool {
+	return inspect.IsExecutable(info) || inLocalBin(env, path)
+}
 
-	// Only read contents of files that could run.
-	if !exec && !inLocalBin {
+func inLocalBin(env *scan.Env, path string) bool {
+	return strings.HasPrefix(path, filepath.Join(env.Home, ".local/bin")+"/") ||
+		strings.HasPrefix(path, filepath.Join(env.Home, "bin")+"/")
+}
+
+func (c *HomeFiles) homeFile(env *scan.Env, path string, info fs.FileInfo, r *scan.Reporter) bool {
+	if !couldRun(env, path, info) {
 		return false
 	}
 	res := inspect.Inspect(path, info.Size())
+	if res.Type == "" {
+		// can't open it: a root scan looks at it without following links
+		if f, err := os.Open(path); err == nil {
+			f.Close()
+		} else if isPerm(err) {
+			r.Unreadable(path)
+			return false
+		}
+	}
+	return c.judge(env, path, info, res, r, func() model.Finding {
+		f := fileFinding(model.KindFile, path, info)
+		for _, fl := range inspect.ModeFlags(path, info, false) {
+			f.AddFlag(fl)
+		}
+		addContent(&f, path, info)
+		return f
+	}, func(hidden bool) *tree {
+		t := c.group(env, path, info, hidden)
+		t.add(path, info)
+		return t
+	})
+}
+
+// judge decides how a file that could run is listed: on its own when it
+// stands out, otherwise in a group. finding builds its finding with the
+// file's own facts; group adds it to its group (nil: list it on its own).
+func (c *HomeFiles) judge(env *scan.Env, path string, info fs.FileInfo, res inspect.Result, r *scan.Reporter,
+	finding func() model.Finding, group func(hidden bool) *tree) bool {
+	exec := inspect.IsExecutable(info)
+	hidden := inspect.IsHidden(path, env.Home)
+	inLocalBin := inLocalBin(env, path)
 	if res.Type != inspect.TypeELF && res.Type != inspect.TypeScript && !exec {
 		return false
 	}
 	c.execs++
 	standsOut := inLocalBin || len(res.Patterns) > 0 || (res.Type == inspect.TypeELF && hidden) || res.Packed
-	if !standsOut {
-		t := c.group(env, path, info, hidden)
+	if !standsOut && group != nil {
+		t := group(hidden)
 		if res.Type == inspect.TypeELF {
 			t.addFlag(model.FlagELF) // compiled programs weigh more than scripts
 		}
-		t.add(path, info)
 		return false
 	}
-	f := fileFinding(model.KindFile, path, info)
+	f := finding()
 	switch {
+	case f.Title != "":
 	case inLocalBin:
 		f.Title = "user command"
 	case res.Type == inspect.TypeELF:
@@ -157,15 +199,127 @@ func (c *HomeFiles) homeFile(env *scan.Env, path string, info fs.FileInfo, r *sc
 	if hidden {
 		f.AddFlag(model.FlagHidden)
 	}
-	for _, fl := range inspect.ModeFlags(path, info, false) {
-		f.AddFlag(fl)
-	}
 	if shadow := shadowsSystem(path); shadow != "" && inLocalBin {
 		f.AddFlag(model.Flag{Code: "shadows", Label: "shadows system command " + shadow, Weight: 35})
 	}
-	addContent(&f, path, info)
 	r.Report(f)
 	return true
+}
+
+// fromUserPart takes the home from the helper that scanned it as you
+// (see scan.UserPart). Root then looks into what you can't open yourself,
+// without following links, and judges it without showing its contents.
+func (c *HomeFiles) fromUserPart(ctx context.Context, env *scan.Env, r *scan.Reporter) error {
+	res, err := env.UserPart.Result(ctx, c.ID())
+	if err != nil {
+		return err
+	}
+	c.groups = map[string]*tree{}
+	ignore := homeIgnoreSet(env.Home)
+	var skipped []string
+	for _, p := range res.Skipped {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if p != filepath.Clean(p) || !strings.HasPrefix(p, env.Home+"/") || !c.locked(ctx, env, p, r, ignore) {
+			skipped = append(skipped, p)
+			continue
+		}
+		// root could look in after all
+		res.Unreadable--
+		if res.Stats != nil {
+			res.Stats["unreadable:"+scan.TopDir(p)]--
+		}
+	}
+	res.Skipped = skipped
+	r.Merge(res)
+	for _, t := range c.groups {
+		t.close(r)
+	}
+	note := res.Note
+	if c.checked > 0 {
+		note += fmt.Sprintf(" · %s only root can read", num(c.checked))
+	}
+	r.Note(note)
+	return ctx.Err()
+}
+
+// locked looks at a file or folder in home that you can't open, as root,
+// never following a link: a link planted there can't lead root elsewhere.
+// It reports whether it could look.
+func (c *HomeFiles) locked(ctx context.Context, env *scan.Env, path string, r *scan.Reporter, ignore *ignoreSet) bool {
+	e, err := inspect.StatNoLinks(path)
+	if err != nil {
+		return false
+	}
+	defer e.Close()
+	switch {
+	case e.Info.Mode().IsRegular():
+		c.lockedFile(env, e, nil, r)
+	case e.Info.IsDir():
+		var t *tree
+		group := func(hidden bool) *tree {
+			if t == nil {
+				t = newTree(path, model.KindTree, "programs only root can read, in "+strings.Replace(path, env.Home, "~", 1), model.FlagExecutable)
+				c.groups[path+"\x00locked"] = t
+			}
+			if hidden {
+				t.addFlag(model.FlagHidden)
+			}
+			return t
+		}
+		inspect.WalkNoLinks(ctx, path,
+			func(p string) bool { return !ignore.match(p, true) },
+			func(e *inspect.Entry) {
+				if !ignore.match(e.Path, false) {
+					c.lockedFile(env, e, group, r)
+				}
+			},
+			func(p string, err error) {
+				if isPerm(err) {
+					r.Unreadable(p)
+				}
+			})
+	default:
+		return false
+	}
+	return true
+}
+
+// lockedFile judges one file only root can read. Ordinary programs go to
+// group; without a group (a single locked file) every program is listed.
+func (c *HomeFiles) lockedFile(env *scan.Env, e *inspect.Entry, group func(bool) *tree, r *scan.Reporter) {
+	c.checked++
+	r.File(e.Path, model.TrustUnknown)
+	defer r.Tick(e.Path, "only root can read")
+	if !couldRun(env, e.Path, e.Info) {
+		return
+	}
+	file, err := e.Open()
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	res := inspect.InspectFile(file, e.Path, e.Info.Size())
+	var inGroup func(bool) *tree
+	if group != nil {
+		inGroup = func(hidden bool) *tree {
+			t := group(hidden)
+			added, _, _ := e.Times()
+			t.addAt(e.Path, e.Info, added)
+			return t
+		}
+	}
+	c.judge(env, e.Path, e.Info, res, r, func() model.Finding {
+		f := entryFinding(model.KindFile, e)
+		for _, fl := range e.ModeFlags(false) {
+			f.AddFlag(fl)
+		}
+		addEntryContent(&f, e, file, res)
+		f.Title = "program in your home only root can read"
+		f.SetFact("readable by", "root only")
+		return f
+	}, inGroup)
 }
 
 // group returns the aggregate for ordinary executables under the same app
@@ -227,6 +381,9 @@ func (c *HomeFiles) configs(ctx context.Context, env *scan.Env, r *scan.Reporter
 		// Omarchy ships this entry: compare file by file.
 		filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
 			if err != nil || ctx.Err() != nil {
+				if isPerm(err) {
+					r.Unreadable(p)
+				}
 				return nil
 			}
 			if ignore.match(p, d.IsDir()) {
@@ -292,6 +449,9 @@ func (c *HomeFiles) extraTree(path string, r *scan.Reporter, ignore *ignoreSet) 
 	t := newTree(path, model.KindConfig, "app config not in Omarchy defaults", model.FlagExtraConfig)
 	filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
+			if isPerm(err) {
+				r.Unreadable(p)
+			}
 			return nil
 		}
 		if ignore.match(p, d.IsDir()) {
@@ -311,7 +471,15 @@ func (c *HomeFiles) extraTree(path string, r *scan.Reporter, ignore *ignoreSet) 
 		r.File(p, model.TrustUnknown)
 		t.add(p, info)
 		if inspect.IsExecutable(info) {
-			if res := inspect.Inspect(p, info.Size()); len(res.Patterns) > 0 || res.Type == inspect.TypeELF {
+			res := inspect.Inspect(p, info.Size())
+			if res.Type == "" {
+				if f, err := os.Open(p); err == nil {
+					f.Close()
+				} else if isPerm(err) {
+					r.Unreadable(p) // a root scan looks at it
+				}
+			}
+			if len(res.Patterns) > 0 || res.Type == inspect.TypeELF {
 				f := fileFinding(model.KindFile, p, info)
 				f.Title = "executable inside app config"
 				f.AddFlag(model.FlagExecutable)

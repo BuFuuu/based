@@ -58,12 +58,17 @@ func (t *tree) contains(path string) bool {
 }
 
 func (t *tree) add(path string, info fs.FileInfo) {
+	added, _, _ := inspect.Times(path)
+	t.addAt(path, info, added)
+}
+
+// addAt is add with the file's added time already known.
+func (t *tree) addAt(path string, info fs.FileInfo, added time.Time) {
 	t.files++
 	t.size += info.Size()
 	if inspect.IsExecutable(info) {
 		t.execs++
 	}
-	added, _, _ := inspect.Times(path)
 	if added.IsZero() {
 		added = info.ModTime()
 	}

@@ -59,7 +59,7 @@ lowest level shown.
 | Needs | Omarchy with Hyprland, a terminal via `xdg-terminal-exec` (Omarchy's default), `wl-copy` for copying, pacman, and Go 1.27+ to build it (`omarchy pkg add go`). |
 | Reads | your files and the system's files, the pacman database, and `/proc` for programs and network connections. |
 | Writes | only `~/.local/state/based` (scans, accepts, reports), `~/.local/bin/based` and its plugin folder. |
-| Root | only when you ask: `based scan --sudo` or `R`. Root only reads: it scans in a separate process started through `sudo` (which asks for your password) and hands the result to your own process, which saves it. Root never writes into your files, and the result holds no file contents you couldn't read yourself. |
+| Root | only when you ask: `based scan --sudo` or `R`, through `sudo` (which asks for your password). Root only reads, and the result holds nothing you couldn't read yourself: see [Scanning as root](#scanning-as-root). |
 | Network | none. Based never uploads, downloads or looks anything up. `install.sh` builds from the files you cloned. |
 | Desktop | opening the window adds a Hyprland rule that floats and sizes it. When the bar icon changes, `install.sh` restarts the Omarchy shell so it loads the new one. |
 
@@ -189,6 +189,33 @@ Shells that run one command (`bash -c …`, as editors and AI agents use them)
 don't count.
 
 ![The Network tab: a program running from /tmp listening on port 8080](network.png)
+
+## Scanning as root
+
+A root scan must read every file: malware hides where only root looks. But
+the result goes to you, and every program you run can read it, malware
+included. So root must never become a way to read a file you couldn't read
+yourself, for example through a link like `~/.bashrc → /etc/shadow`.
+
+**Why no kernel part, like an antivirus?** An antivirus runs all the time,
+so it lives in the kernel to watch everything and to keep malware from
+killing it. Based runs only when you ask, and against someone who already
+has root no program is safe anyway (see [Limits](#limits)). Its job is
+smaller: read everything, hand out nothing secret.
+
+**How SSH does it.** The OpenSSH server splits itself: a small part keeps
+root, and the parts that handle a login give up root early. It reads your
+`authorized_keys` with your rights, not root's. Based splits the same way.
+
+| Rule | How |
+|---|---|
+| Your home is scanned as you | Root starts a helper with your rights for your home and the startup files in it, and only merges what it finds. |
+| No links where others can write | Where root itself still looks (`/tmp`, `/var/tmp`, `/dev/shm`, folders in your home you can't open, programs running from there), it opens each name inside its folder, already open, and never follows a link. |
+| Verdicts, not contents | For a file you can't read, the result keeps the verdict ("grants sudo without a password", "risky pattern: download piped to shell") but no text, preview or hash. A hash could confirm a guess. The text shows as "hidden: only root can read this file". |
+| Root only reads | Root writes nothing. Your own process saves the result. |
+
+You still see a root-only file's name, size, owner, permissions, times and
+flags. `sudo cat <path>` shows the rest.
 
 ## Limits
 

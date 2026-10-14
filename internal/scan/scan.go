@@ -5,6 +5,7 @@ package scan
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -40,6 +41,20 @@ type Env struct {
 	// Defaults holds the packages of the Omarchy install (set by the
 	// package database phase).
 	Defaults map[string]bool
+
+	// A root scan for a user leaves their home to a helper that runs as
+	// them (see UserPart). ReportTo is that user, UserPart the helper's
+	// results; HomeOnly is set inside the helper.
+	ReportTo *Account
+	UserPart *UserPart
+	HomeOnly bool
+}
+
+// Account is the user a root scan reports to.
+type Account struct {
+	Name     string
+	UID, GID int
+	GIDs     []int
 }
 
 // Repos built and signed by Arch Linux itself, and by Omarchy ("offline" is
@@ -81,26 +96,41 @@ func NewEnv() *Env {
 		env.OmarchyPath = p
 	}
 	env.Home, _ = os.UserHomeDir()
-	if su := os.Getenv("SUDO_USER"); env.IsRoot && su != "" {
-		// a root scan for this user: scan their home, and share with them
-		// only contents they could read themselves
-		if u, err := user.Lookup(su); err == nil {
-			env.Home = u.HomeDir
-			uid, _ := strconv.Atoi(u.Uid)
-			var gids []int
-			ids, _ := u.GroupIds()
-			for _, g := range ids {
-				if n, err := strconv.Atoi(g); err == nil {
-					gids = append(gids, n)
-				}
-			}
-			inspect.LimitContentTo(uid, gids)
+	if su := os.Getenv("SUDO_USER"); env.IsRoot && su != "" && su != "root" {
+		// a root scan for this user: their home is scanned as them (see
+		// UserPart), and they get only contents they could read themselves
+		acct, home, err := lookupAccount(su)
+		if err != nil {
+			// share only what anyone could read, and scan no home
+			inspect.LimitContentTo(65534, nil)
+			env.UserPart = failedUserPart(err)
 		} else {
-			inspect.LimitContentTo(65534, nil) // unknown user: share only what anyone could read
+			env.Home, env.ReportTo = home, acct
+			inspect.LimitContentTo(acct.UID, acct.GIDs)
 		}
 	}
 	env.Home = filepath.Clean(env.Home)
 	return env
+}
+
+func lookupAccount(name string) (*Account, string, error) {
+	u, err := user.Lookup(name)
+	if err != nil {
+		return nil, "", fmt.Errorf("can't look up user %q: %w", name, err)
+	}
+	uid, err1 := strconv.Atoi(u.Uid)
+	gid, err2 := strconv.Atoi(u.Gid)
+	if err1 != nil || err2 != nil || uid == 0 || u.HomeDir == "" {
+		return nil, "", fmt.Errorf("user %q has no usable uid, gid or home", name)
+	}
+	acct := &Account{Name: u.Username, UID: uid, GID: gid}
+	ids, _ := u.GroupIds()
+	for _, g := range ids {
+		if n, err := strconv.Atoi(g); err == nil {
+			acct.GIDs = append(acct.GIDs, n)
+		}
+	}
+	return acct, u.HomeDir, nil
 }
 
 // Phase is the live state of one collector, read by the UI.
@@ -117,7 +147,11 @@ type Phase struct {
 	Err        error
 	Note       string         // short summary shown when done
 	Stats      map[string]int // free-form counters, e.g. files checked per trust level
+
+	skipped []string // paths that could not be opened (the first maxSkipped)
 }
+
+const maxSkipped = 256
 
 const (
 	PhasePending int32 = iota
@@ -146,7 +180,9 @@ type Progress struct {
 	findings []model.Finding
 	entries  []model.Entry
 	net      []model.Entry
-	counts   [4]int
+
+	entryPhase []string // the phase of each entry
+	counts     [4]int
 }
 
 // Recent returns up to n of the latest events, oldest first.
@@ -215,6 +251,9 @@ func (r *Reporter) Tick(path, detail string) {
 // Unreadable records an item that could not be checked (usually permissions).
 func (r *Reporter) Unreadable(path string) {
 	r.phase.Unreadable.Add(1)
+	if len(r.phase.skipped) < maxSkipped {
+		r.phase.skipped = append(r.phase.skipped, path)
+	}
 	r.Stat("unreadable:" + TopDir(path))
 }
 
@@ -254,6 +293,7 @@ func (r *Reporter) Entry(e model.Entry, f *model.Finding) {
 	}
 	r.progress.mu.Lock()
 	r.progress.entries = append(r.progress.entries, e)
+	r.progress.entryPhase = append(r.progress.entryPhase, r.phase.ID)
 	r.progress.mu.Unlock()
 }
 

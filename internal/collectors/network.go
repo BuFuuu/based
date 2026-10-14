@@ -150,7 +150,7 @@ func mechanismOf(s *netSock) string {
 
 func readSockTable(path, proto string) []*netSock {
 	var out []*netSock
-	lines := readLines(path)
+	lines := sharedLines(path)
 	for _, l := range lines[min(1, len(lines)):] {
 		f := strings.Fields(l)
 		if len(f) < 10 {
@@ -186,7 +186,7 @@ func readSockTable(path, proto string) []*netSock {
 // /proc/net/packet: sk RefCnt Type Proto Iface R Rmem User Inode
 func readPacketTable(path string) []*netSock {
 	var out []*netSock
-	lines := readLines(path)
+	lines := sharedLines(path)
 	for _, l := range lines[min(1, len(lines)):] {
 		f := strings.Fields(l)
 		if len(f) < 9 {
@@ -262,7 +262,7 @@ func (c *Network) matchProcs(socks map[uint64]*netSock) {
 		}
 		if len(p.socks) > 0 {
 			p.exe, _ = os.Readlink(dir + "/exe")
-			p.args = strings.Split(strings.TrimRight(string(readFileSmall(dir+"/cmdline")), "\x00"), "\x00")
+			p.args = strings.Split(strings.TrimRight(string(sharedSmall(dir+"/cmdline")), "\x00"), "\x00")
 			if info, err := os.Stat(dir); err == nil {
 				p.uid = int(info.Sys().(*syscall.Stat_t).Uid)
 			}
@@ -281,7 +281,7 @@ func containsSock(list []*netSock, s *netSock) bool {
 
 // procStat returns the parent pid and the start time from /proc/<pid>/stat.
 func (c *Network) procStat(dir string) (int, time.Time) {
-	b := readFileSmall(dir + "/stat")
+	b := sharedSmall(dir + "/stat")
 	i := strings.LastIndexByte(string(b), ')') // the name may contain spaces
 	if i < 0 {
 		return 0, time.Time{}
@@ -299,7 +299,7 @@ func (c *Network) procStat(dir string) (int, time.Time) {
 }
 
 func bootTime() time.Time {
-	for _, l := range readLines("/proc/stat") {
+	for _, l := range sharedLines("/proc/stat") {
 		if v, ok := strings.CutPrefix(l, "btime "); ok {
 			if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil {
 				return time.Unix(n, 0)
@@ -355,7 +355,7 @@ func (c *Network) program(p *netProc) netProgram {
 	// Is the path the program sees the same file as on this system? Not in
 	// a sandbox or container, and not after the file was replaced.
 	running, err1 := os.Stat("/proc/" + strconv.Itoa(p.pid) + "/exe")
-	onDisk, err2 := os.Stat(exe)
+	onDisk, err2 := statNoPlantedLinks(c.env.Home, exe)
 	same := err1 == nil && err2 == nil && os.SameFile(running, onDisk)
 	if !same {
 		ns, _ := os.Readlink("/proc/" + strconv.Itoa(p.pid) + "/ns/mnt")
@@ -395,7 +395,7 @@ func (c *Network) program(p *netProc) netProgram {
 
 	owner := c.env.Pacman.Owner(exe)
 	if prog.kind == "interpreter" {
-		script, inline := scriptOf(p, base)
+		script, inline := scriptOf(p, base, c.env.Home)
 		switch {
 		case inline:
 			prog.flags = append(prog.flags, model.FlagNetInline)
@@ -429,7 +429,7 @@ func (c *Network) program(p *netProc) netProgram {
 }
 
 func flatpakApp(pid int) string {
-	for _, l := range readLines("/proc/" + strconv.Itoa(pid) + "/root/.flatpak-info") {
+	for _, l := range sharedLines("/proc/" + strconv.Itoa(pid) + "/root/.flatpak-info") {
 		if v, ok := strings.CutPrefix(l, "name="); ok {
 			return v
 		}
@@ -439,7 +439,7 @@ func flatpakApp(pid int) string {
 
 // scriptOf finds the file an interpreter runs. inline is true when the code
 // is not in a file: given with -c/-e, piped in, or typed at a prompt.
-func scriptOf(p *netProc, interp string) (script string, inline bool) {
+func scriptOf(p *netProc, interp, home string) (script string, inline bool) {
 	inlineOpts := map[string]bool{"-c": true, "-e": true, "-E": true, "--eval": true, "-p": true, "--print": true, "-r": true}
 	valueOpts := map[string]bool{"-W": true, "-X": true, "-Q": true, "--require": true, "--import": true, "--loader": true,
 		"-I": true, "-cp": true, "-classpath": true}
@@ -451,7 +451,7 @@ func scriptOf(p *netProc, interp string) (script string, inline bool) {
 		if !filepath.IsAbs(a) {
 			a = filepath.Join(cwd, a)
 		}
-		if info, err := os.Stat(a); err == nil && info.Mode().IsRegular() {
+		if info, err := statNoPlantedLinks(home, a); err == nil && info.Mode().IsRegular() {
 			return a
 		}
 		return ""
@@ -489,7 +489,7 @@ func scriptOf(p *netProc, interp string) (script string, inline bool) {
 // from its input, as a reverse shell does. Shells that run one command
 // (bash -c ..., as editors and AI agents use them) or a script do not.
 func interactiveShell(pid int) bool {
-	return interactiveShellArgs(strings.Split(strings.TrimRight(string(readFileSmall("/proc/"+strconv.Itoa(pid)+"/cmdline")), "\x00"), "\x00"))
+	return interactiveShellArgs(strings.Split(strings.TrimRight(string(sharedSmall("/proc/"+strconv.Itoa(pid)+"/cmdline")), "\x00"), "\x00"))
 }
 
 func interactiveShellArgs(args []string) bool {
@@ -629,7 +629,7 @@ func (c *Network) report(mech string, prog netProgram, procs []*netProc, socks [
 	// an accept covers this program doing this kind of thing; it is voided
 	// when the program file changes, it gains a warning sign, or (for a
 	// listener) it opens other ports
-	fp := programHash(prog.path)
+	fp := programHash(c.env.Home, prog.path)
 	for _, fl := range f.Flags {
 		fp += "\x00" + fl.Code
 	}
@@ -756,21 +756,63 @@ func place(a netip.Addr) string {
 	return "internet"
 }
 
-func programHash(path string) string {
-	info, err := os.Stat(path)
+func programHash(home, path string) string {
+	info, err := statNoPlantedLinks(home, path)
 	if err != nil {
 		return path
 	}
 	if info.Size() < 128<<20 {
-		if h, err := inspect.SHA256(path); err == nil {
+		if h := sharedHashNoPlantedLinks(home, path); h != "" {
 			return h
 		}
 	}
 	return strconv.FormatInt(info.Size(), 10) + ":" + strconv.FormatInt(info.ModTime().UnixNano(), 10)
 }
 
+// statNoPlantedLinks is os.Stat, except that a root scan follows no links
+// in places others can write (home, /tmp): a program's path there may have
+// been swapped for a link since it started.
+func statNoPlantedLinks(home, path string) (os.FileInfo, error) {
+	if !inspect.Limited() || !planted(home, path) {
+		return os.Stat(path)
+	}
+	e, err := inspect.StatNoLinks(path)
+	if err != nil {
+		return nil, err
+	}
+	defer e.Close()
+	return e.Info, nil
+}
+
+func sharedHashNoPlantedLinks(home, path string) string {
+	if !inspect.Limited() || !planted(home, path) {
+		return inspect.SharedSHA256(path)
+	}
+	e, err := inspect.StatNoLinks(path)
+	if err != nil {
+		return ""
+	}
+	defer e.Close()
+	f, err := e.Open()
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	return inspect.SharedSHA256File(f, path)
+}
+
+// planted reports whether a path is in a place where users can make links.
+func planted(home, path string) bool {
+	for _, p := range []string{home + "/", "/home/", "/tmp/", "/var/tmp/", "/dev/shm/", "/run/user/"} {
+		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func userName(uid int) string {
-	for _, l := range readLines("/etc/passwd") {
+	for _, l := range sharedLines("/etc/passwd") {
 		f := strings.Split(l, ":")
 		if len(f) > 2 && f[2] == strconv.Itoa(uid) {
 			return f[0]

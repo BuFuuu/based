@@ -17,3 +17,14 @@ func All() []scan.Collector {
 		&Network{},
 	}
 }
+
+// HomePart is what the helper of a root scan runs as the user: the package
+// database (the home phases compare against it), the home, and the
+// persistence kept in it.
+func HomePart() []scan.Collector {
+	return []scan.Collector{
+		&PacmanDB{},
+		&HomeFiles{},
+		&Persistence{},
+	}
+}

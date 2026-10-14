@@ -476,6 +476,13 @@ func (c *SystemFiles) ownedFile(env *scan.Env, pkg *pacman.Package, path string,
 		}
 		f.SetFact("package", pkg.Name+" "+pkg.Version)
 		f.Fingerprint = sum
+		if !inspect.Shared(path) {
+			// a hash would let the user confirm a guess at what it says;
+			// any edit changes the change time
+			if st, ok := info.Sys().(*syscall.Stat_t); ok {
+				f.Fingerprint = fmt.Sprintf("%d:%d:%d", info.Size(), info.ModTime().UnixNano(), st.Ctim.Nano())
+			}
+		}
 		c.report(r, f)
 		return
 	}

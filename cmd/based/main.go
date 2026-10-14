@@ -96,7 +96,12 @@ func cmdScan(args []string) error {
 	asRoot := fs.Bool("sudo", false, "scan as root for full coverage; your own process saves the result")
 	emit := fs.Bool("emit", false, "internal: scan and print the result as JSON instead of saving it")
 	prevArg := fs.String("prev", "", "internal: items per phase in the last scan, as JSON, for the progress bars")
+	userPart := fs.Bool("user-part", false, "internal: the home half of a root scan, run as the user")
 	parse(fs, args)
+
+	if *userPart {
+		return scanUserPart(*deep)
+	}
 
 	if *emit {
 		// The root half of `based scan --sudo`: it reads the system and
@@ -222,6 +227,13 @@ func runScan(deep, plain bool, prevCounts map[string]int, w io.Writer) (*store.S
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sig)
 	go func() { <-sig; cancel() }()
+	if env.ReportTo != nil {
+		cmd, err := userPartCmd(ctx, env)
+		if err != nil {
+			return nil, false, err
+		}
+		env.UserPart = scan.StartUserPart(cmd)
+	}
 
 	who := "user " + os.Getenv("USER")
 	if env.IsRoot {
@@ -295,6 +307,51 @@ func runScan(deep, plain bool, prevCounts map[string]int, w io.Writer) (*store.S
 		}
 	}
 	return snap, false, nil
+}
+
+// userPartCmd is the helper of a root scan: this program, run as the user
+// the scan reports to, with their groups and a clean environment, scanning
+// only their home.
+func userPartCmd(ctx context.Context, env *scan.Env) (*exec.Cmd, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	argv := []string{"scan", "--user-part"}
+	if env.Deep {
+		argv = append(argv, "--deep")
+	}
+	a := env.ReportTo
+	groups := make([]uint32, 0, len(a.GIDs))
+	for _, g := range a.GIDs {
+		groups = append(groups, uint32(g))
+	}
+	cmd := exec.CommandContext(ctx, exe, argv...)
+	cmd.Dir = "/"
+	cmd.Env = []string{"HOME=" + env.Home, "USER=" + a.Name, "LOGNAME=" + a.Name,
+		"PATH=/usr/local/bin:/usr/bin", "LANG=C.UTF-8", "OMARCHY_PATH=" + env.OmarchyPath}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Credential: &syscall.Credential{Uid: uint32(a.UID), Gid: uint32(a.GID), Groups: groups},
+		Setsid:     true, // no terminal: the root half draws there
+		Pdeathsig:  syscall.SIGKILL,
+	}
+	return cmd, nil
+}
+
+// scanUserPart is the helper: it scans the home as its owner and prints
+// what it found as JSON for the root half.
+func scanUserPart(deep bool) error {
+	if os.Geteuid() == 0 {
+		return fmt.Errorf("--user-part scans a home as its owner, not as root")
+	}
+	env := scan.NewEnv()
+	env.Deep, env.HomeOnly = deep, true
+	cs := collectors.HomePart()
+	progress := scan.NewProgress(cs)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	scan.Run(ctx, env, cs, progress, nil)
+	return json.NewEncoder(os.Stdout).Encode(scan.Results(progress))
 }
 
 func loadLatest() (*store.Store, *store.Snapshot, error) {
